@@ -1,0 +1,722 @@
+---
+title: "Parallelization of overland flow and sediment transport simulation"
+author: "Anna Petrasova"
+date: 2025-05-02
+date-modified: today
+format:
+  ipynb: default
+  html:
+    toc: true
+    code-tools: true
+    code-copy: true
+    code-fold: false
+categories: [Python, advanced, parallelization]
+description: Learn how to run parallelized flow and erosion simulation across subwatersheds.
+engine: jupyter
+execute: 
+  eval: false
+jupyter: python3
+---
+
+# Parallelization of overland flow and sediment transport simulation
+In this tutorial we will analyze overland water flow and erosion and deposition patterns along a Yadkin river in North Carolina, USA. We will use SIMWE model for the flow and erosion modeling with simplified runoff inputs based on National Land Cover Dataset (NLCD). We will use hydrologic units (HUC 12, subwatersheds, approximately 100 km2) along the river to divide our computation and parallelize it. We will use National Elevation Dataset (NED) at 1/3 arc-second (approximately 10 m) resolution.
+
+Concepts covered in this tutorial:
+
+* Data ingestion
+* Managing GRASS projects
+* Data reprojection
+* Basic vector and raster data processing
+* Computational region
+* Using mask to mask out subwatershed area
+* Parallelization of a computational workflow
+* Overland water flow and sediment transport simulation
+
+Start with importing Python packages.
+To import the grass package, you need to tell Python where the GRASS Python package is.
+
+
+```python
+# import standard Python packages
+import os
+import sys
+import subprocess
+from pathlib import Path
+import urllib.request
+import zipfile
+from tqdm import tqdm
+
+# check where GRASS python packages are and add them to PATH
+sys.path.append(
+    subprocess.check_output(["grass8", "--config", "python_path"], text=True).strip()
+)
+# import GRASS GIS python packages
+import grass.script as gs
+import grass.jupyter as gj
+```
+
+We will switch our working directory to a directory with enough space, this is where we will download the datsets.
+With that, we will be able to use shorter, relative paths.
+
+
+```python
+os.chdir("path/to/data")
+```
+
+We will create a temporary folder, that will store our GRASS projects, since we don't need to retain them after we are done with the analysis.
+
+
+```python
+import tempfile
+tempdir = tempfile.TemporaryDirectory()
+project_path = tempdir.name
+```
+
+## Download and link NLCD data
+Link to the NLCD data can be found at [mrlc.gov/data](https://www.mrlc.gov/data).
+
+
+```python
+url = "https://www.mrlc.gov/downloads/sciweb1/shared/mrlc/data-bundles/Annual_NLCD_LndCov_2023_CU_C1V0.tif"
+nlcd_filename, headers = urllib.request.urlretrieve(url)
+```
+
+Create a GRASS project with the coordinate reference system (CRS) based on the NLCD data and link the data there with r.external.
+Note that r.external does not import the data, only creates a virtual raster that we will later use. The advantage here is that we don't need the entire raster (NLCD is provided as a file covering conterminous US), just small sections of it.
+
+
+```python
+nlcd_project = f"{Path(project_path, "nlcd")}"
+# create a project
+gs.create_project(nlcd_project, filename=nlcd_filename)
+# initialize GRASS session in that project
+session = gj.init(nlcd_project)
+# create the virtual raster named "nlcd"
+gs.run_command("r.external", input=nlcd_filename, output="nlcd")
+```
+
+## Download and process NC hydrography dataset
+We will download and unzip [National Hydrography Dataset](https://www.usgs.gov/national-hydrography/access-national-hydrography-products) for North Carolina and create a GRASS project, in which we will extract the river and adjacent subwatersheds.
+
+
+```python
+url = "https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHD/State/GPKG/NHD_H_North_Carolina_State_GPKG.zip"
+hydro_filename, headers = urllib.request.urlretrieve(url)
+with zipfile.ZipFile(hydro_filename, "r") as zip_ref:
+    zip_ref.extractall()
+os.remove(hydro_filename)
+hydro_filename = Path(url).stem + ".gpkg"
+```
+
+Create the GRASS project called "hydro" based on the hydrography data, the data is in latitude-longitude CRS.
+
+
+```python
+hydro_project = f"{Path(project_path, "hydro")}"
+
+gs.create_project(hydro_project, filename=hydro_filename)
+session = gj.init(hydro_project)
+```
+
+First, let's list the layers available:
+
+
+```python
+gs.run_command("v.in.ogr", input=hydro_filename, flags="l")
+```
+
+Now we will import hydrography boundaries HUC12 (WBDHU12) to get the subwatersheds and the flow lines (NHDFlowline) to extract the specific river.
+
+
+```python
+gs.run_command("v.in.ogr", input=hydro_filename, layer="WBDHU12")
+gs.run_command("v.in.ogr", input=hydro_filename, layer="NHDFlowline", where="gnis_name == 'Yadkin River'", output="river")
+```
+
+Next, we want to extract the subwatersheds along the river.
+If we simply overlap the river and the subwatersheds, we will miss some of them:
+
+
+```python
+gs.run_command("v.select", ainput="WBDHU12", binput="river", output="river_basins", operator="overlap")
+
+basin_map = gj.InteractiveMap()
+basin_map.add_vector("river_basins")
+basin_map.add_vector("river")
+basin_map.show()
+```
+
+So instead we will buffer the river first:
+
+
+```python
+gs.run_command("v.buffer", input="river", output="river_buffer", distance=0.01)
+gs.run_command("v.select", ainput="WBDHU12", binput="river_buffer", output="river_basins", operator="overlap")
+
+basin_map = gj.InteractiveMap()
+basin_map.add_vector("river_basins")
+basin_map.add_vector("river")
+basin_map.show()
+```
+
+The rest of the workflow will be done in a CRS used in North Carolina (EPSG 3358).
+
+## Reprojecting vector data to NC CRS
+Since we want our project to use a different CRS more suitable for our study area (EPSG:3358 for North Carolina), we will create it now: 
+
+
+```python
+gs.create_project(path=project_path,
+                  name="NC",
+                  epsg="3358")
+session = gj.init(f"{Path(project_path, "NC")}")
+```
+
+We will reproject the river subwatersheds vector:
+
+
+```python
+gs.run_command("v.proj", input="river_basins", project="hydro")
+```
+
+## Downloading NED elevation data
+We will use GRASS addon r.in.usgs to download and import NED layer using [USGS TNM Access API](https://apps.nationalmap.gov/tnmaccess/).
+First, we will set the computational region to match the river subwatersheds and then list available datasets
+for that region:
+
+
+
+```python
+gs.run_command("g.region", vector="river_basins")
+print(gs.read_command("r.in.usgs", product="ned", ned_dataset="ned13sec", flags="i", output_directory=os.getcwd()))
+```
+
+    USGS file(s) to download:
+    -------------------------
+    Total download size:	4.83 GB
+    Tile count:	16
+    USGS SRS:	wgs84
+    USGS tile titles:
+    USGS 1/3 Arc Second n36w081 20240510
+    USGS 1/3 Arc Second n36w082 20220504
+    USGS 1/3 Arc Second n36w082 20220512
+    USGS 1/3 Arc Second n36w082 20240510
+    USGS 1/3 Arc Second n37w080 20210305
+    USGS 1/3 Arc Second n37w081 20210305
+    USGS 1/3 Arc Second n37w081 20240510
+    USGS 1/3 Arc Second n37w082 20210305
+    USGS 1/3 Arc Second n37w082 20220512
+    USGS 1/3 Arc Second n37w082 20240510
+    USGS 13 arc-second n36w080 1 x 1 degree
+    USGS 13 arc-second n36w081 1 x 1 degree
+    USGS 13 arc-second n36w082 1 x 1 degree
+    USGS 13 arc-second n37w080 1 x 1 degree
+    USGS 13 arc-second n37w081 1 x 1 degree
+    USGS 13 arc-second n37w082 1 x 1 degree
+    -------------------------
+    
+
+
+We will select the 2024 data and use the `title_filter` option to filter them.
+We will first only download the datasets and use them later.
+
+
+```python
+gs.run_command("r.in.usgs", product="ned", ned_dataset="ned13sec", flags="d",
+                output_directory=os.getcwd(), title_filter="20240510")
+```
+
+Let's compute the erosion/deposition for one of the subwatersheds.
+
+## Flow and erosion modeling for a single subwatershed
+
+We begin our analysis by selecting a single HUC12 subwatershed from the set of intersected basins. This subset will be used to test the erosion and deposition simulation workflow. For all outputs, we will use unique names with the subwatershed code as a prefix. That will help us with parallelization later on.
+
+Use [v.db.select](https://grass.osgeo.org/grass-devel/manuals/v.db.select.html) to retrieve the list of HUC12 codes from the attribute table.
+Extract the first HUC12 polygon using [v.extract](https://grass.osgeo.org/grass-devel/manuals/v.extract.html).
+
+
+```python
+# Select for example first huc12
+huc12 = gs.parse_command("v.db.select", map="river_basins", format="json")["records"][0]["huc12"]
+gs.run_command("v.extract", input="river_basins", output=f"basin_{huc12}", where=f"huc12 == '{huc12}'", flags="t")
+```
+
+Set the computational region with [g.region](https://grass.osgeo.org/grass-devel/manuals/g.region.html) to match the bounds of the selected subwatershed.
+
+
+```python
+vinfo = gs.vector_info(f"basin_{huc12}")
+gs.run_command("g.region", n=vinfo["north"], s=vinfo["south"], e=vinfo["east"], w=vinfo["west"])
+```
+
+Import the NED data for that subwatershed. r.in.usgs will use already downloaded data.
+
+
+```python
+gs.read_command("r.in.usgs", product="ned", ned_dataset="ned13sec", cache_size_tolerance=int(1e10),
+                output_directory=os.getcwd(), title_filter="20240510", output_name=f"ned_{huc12}")
+basin_map = gj.Map()
+basin_map.d_rast(map=f"ned_{huc12}")
+basin_map.d_vect(map=f"basin_{huc12}", fill_color="none")
+basin_map.show()
+```
+
+    
+
+Set the region to match the elevation raster.
+Convert the selected vector to a raster using [v.to.rast](https://grass.osgeo.org/grass-devel/manuals/v.to.rast.html).
+
+
+
+```python
+gs.run_command("g.region", raster=f"ned_{huc12}")
+gs.run_command("v.to.rast", input=f"basin_{huc12}", output=f"basin_{huc12}", use="val")
+```
+
+Apply a raster mask with [r.mask](https://grass.osgeo.org/grass-devel/manuals/r.mask.html) to restrict all subsequent raster operations to this subwatershed.
+
+
+```python
+gs.run_command("r.mask", raster=f"basin_{huc12}")
+
+basin_map = gj.Map()
+basin_map.d_rast(map=f"ned_{huc12}")
+basin_map.show()
+```
+
+
+Reproject NLCD from a "nlcd" project to this project:
+
+
+```python
+gs.run_command("r.proj", project="nlcd", mapset="PERMANENT", input="nlcd", output=f"nlcd_{huc12}")
+
+basin_map = gj.Map()
+basin_map.d_rast(map=f"nlcd_{huc12}")
+basin_map.show()
+```
+
+We will create a file `mannings.txt` to reclassify NLCD to manning's coefficients. The values are suggestions from the [r.sim.water](https://grass.osgeo.org/grass-devel/manuals/r.sim.water.html) documentation. The format is described in [r.recode](https://grass.osgeo.org/grass-devel/manuals/r.recode.html) documentation.
+
+
+```python
+%%writefile mannings.txt
+11:11:0.001
+21:21:0.0404
+22:23:0.0678
+24:24:0.0404
+31:31:0.0113
+41:41:0.36
+42:42:0.32
+43:52:0.4
+52:52:0.4
+71:71:0.368
+81:82:0.325
+90:90:0.086
+95:95:0.1825
+```
+
+    Writing mannings.txt
+
+
+
+```python
+gs.run_command("r.recode", input=f"nlcd_{huc12}", output=f"mannings_{huc12}", rules="mannings.txt")
+```
+
+Similarly, we will reclassify rainfall excess (rainfall minus infiltration).
+These values were derived from 50 mm/hr rainfall event and are only rough estimates.
+
+
+```python
+%%writefile runoff.txt
+11:11:0.0
+21:21:3.3     # Developed Open Space (CN ~68, HSG B)
+22:22:7.9     # Developed Low Intensity (CN ~81, HSG C)
+23:23:19.8    # Developed Medium Intensity (CN ~90, HSG C)
+24:24:27.9    # Developed High Intensity (CN ~94, HSG D)
+31:31:6.1     # Barren (CN ~75, HSG B)
+41:41:0.0     # Forest (CN ~55, HSG A) — P < 0.2S → Q = 0
+42:42:0.0
+43:43:0.0
+52:52:3.3     # Shrub/Scrub (CN ~68, HSG B)
+71:71:2.0     # Grassland (CN ~61, HSG A)
+81:81:5.1     # Pasture (CN ~74, HSG B)
+82:82:14.7    # Cropland (CN ~82, HSG C)
+90:90:0.0     # Woody Wetlands (CN ~70, HSG D) — often saturated, still low Q here
+95:95:0.0     # Herbaceous Wetlands
+```
+
+    Writing runoff.txt
+
+
+
+```python
+gs.run_command("r.recode", input=f"nlcd_{huc12}", output=f"runoff_{huc12}", rules="runoff.txt")
+```
+
+Then, compute slope components (dx and dy) from the elevation raster to support hydrologic modeling.
+
+
+```python
+gs.run_command("r.slope.aspect", elevation=f"ned_{huc12}", dx=f"dx_{huc12}", dy=f"dy_{huc12}")
+```
+
+Run hydrologic and sediment simulations for the selected subwatershed.
+First, simulate overland flow using [r.sim.water](https://grass.osgeo.org/grass-devel/manuals/r.sim.water.html)
+with inputs for topography, Manning’s coefficients, and rainfall intensity.
+Running the simulation may take a while.
+
+
+```python
+simulation_time = 300
+gs.run_command("r.sim.water", elevation=f"ned_{huc12}", dx=f"dx_{huc12}", dy=f"dy_{huc12}",
+               depth=f"depth_{huc12}", niterations=simulation_time, man=f"mannings_{huc12}", rain=f"runoff_{huc12}")
+
+basin_map = gj.Map()
+basin_map.d_rast(map=f"depth_{huc12}")
+basin_map.show()
+```
+
+Then, define parameters for sediment transport and run [r.sim.sediment](https://grass.osgeo.org/grass-devel/manuals/r.sim.sediment.html)
+to compute erosion and deposition patterns. We will trim the resulting raster's edges to avoid extreme values at the edge.
+
+
+```python
+gs.mapcalc(f"transport_capacity_{huc12} = 0.001")
+gs.mapcalc(f"detachment_coef_{huc12} = 0.001")
+gs.mapcalc(f"shear_stress_{huc12} = 0.01")
+gs.run_command("r.sim.sediment", elevation="ned", water_depth=f"depth_{huc12}", dx=f"dx_{huc12}", dy=f"dy_{huc12}",
+               detachment_coeff=f"detachment_coef_{huc12}", transport_coeff=f"transport_capacity_{huc12}", shear_stress=f"shear_stress_{huc12}",
+               niterations=simulation_time, erosion_deposition=f"erdep_tmp_{huc12}", nwalkers=5 * gs.region()["cells"])
+gs.run_command("r.grow", input=f"erdep_tmp_{huc12}", output=f"erdep_{huc12}", radius=-2.01)
+
+basin_map = gj.Map()
+basin_map.d_rast(map=f"erdep_{huc12}")
+basin_map.show()
+```
+
+Calculate total erosion and deposition for the subwatershed.
+Negative values from [r.sim.sediment](https://grass.osgeo.org/grass-devel/manuals/r.sim.sediment.html)
+output are treated as erosion and converted to sediment mass; positive values represent deposition.
+Summary statistics are computed using [r.univar](https://grass.osgeo.org/grass-devel/manuals/r.univar.html).
+
+
+
+```python
+# Erosion: extract negative values and convert to positive mass [kg/m^2]
+gs.mapcalc(f"erosion_{huc12} = if(erdep_{huc12} < 0, abs(erdep_{huc12}) * {simulation_time * 60}, null())")
+erosion = gs.parse_command("r.univar", map=f"erosion_{cat}", format="json")[0]
+# Deposition: extract positive values and convert to mass [kg/m^2]
+gs.mapcalc(f"deposition_{huc12} = if(erdep_{huc12} > 0, abs(erdep_{huc12}) * {simulation_time * 60}, null())")
+deposition = gs.parse_command("r.univar", map=f"deposition_{huc12}", format="json")[0]
+print({"huc12": huc12, "erosion": erosion, "deposition": deposition})
+```
+
+Remove the active raster mask using [r.mask](https://grass.osgeo.org/grass-devel/manuals/r.mask.html) with the `-r` flag, restoring operations to apply across the full region.
+
+
+
+```python
+gs.run_command("r.mask", flags="r")
+```
+
+Display water depth (`depth`) and erosion-deposition (`erdep`) rasters for the selected subwatershed.
+
+
+```python
+basin_map = gj.InteractiveMap()
+basin_map.add_raster(f"depth_{huc12}")
+basin_map.add_raster(f"erdep_{huc12}")
+basin_map.show()
+```
+
+## Parallelized Hydrologic and Sediment Modeling
+
+To efficiently model erosion and deposition across a large number of HUC12 subwatersheds,
+we will use the workflow we just ran and create a
+script that uses Python’s `multiprocessing` module to parallelize the workflow.
+Each subwatershed is processed independently in its own environment, which allows computations to run concurrently without interference.
+
+To make the parallelization work, we need to modify 2 things, mask and computational region.
+
+* Masking is handled using `MaskManager` to restrict operations to each subarea, ensuring accurate and isolated calculations. This feature is available only since GRASS 8.5.
+* 
+
+Results are collected and stored in a JSON file for further analysis.
+
+
+
+```python
+%%writefile script.py
+import os
+import json
+from multiprocessing import Pool
+from tqdm import tqdm
+
+import grass.script as gs
+
+
+def compute(huc12):
+    print(huc12)
+    subarea = f"basin_{huc12}"
+    simulation_time = 300
+    gs.run_command("v.extract", input="river_basins", output=subarea, where=f"huc12 == '{huc12}'", flags="t")
+    vinfo = gs.vector_info(subarea)
+    # Create a copy of the environment for this process before modifying it.
+    env = os.environ.copy()
+    # Set the computational region to match non-null area in the new raster.
+    env["GRASS_REGION"] = gs.region_env(n=vinfo["north"], s=vinfo["south"], e=vinfo["east"], w=vinfo["west"], env=env)
+    gs.run_command("r.in.usgs", product="ned", ned_dataset="ned13sec", cache_size_tolerance=int(1e10),
+                   output_directory=os.getcwd(), title_filter="20240510", output_name=f"ned_{huc12}")
+    env["GRASS_REGION"] = gs.region_env(raster=f"ned_{huc12}", env=env)
+    gs.run_command("v.to.rast", input=subarea, output=subarea, use="val", env=env)
+    region = gs.region(env=env)
+
+    with gs.MaskManager(mask_name=subarea, env=env):
+       # Run actual computation with active mask.
+        gs.run_command("r.proj", project="nlcd", mapset="PERMANENT", input="nlcd", output=f"nlcd_{huc12}", env=env)
+        gs.run_command("r.recode", input=f"nlcd_{huc12}", output=f"mannings_{huc12}", rules="mannings.txt", env=env)
+        gs.run_command("r.recode", input=f"nlcd_{huc12}", output=f"runoff_{huc12}", rules="runoff.txt", env=env)
+        gs.run_command("r.slope.aspect", elevation="ned", dx=f"dx_{huc12}", dy=f"dy_{huc12}", env=env)
+
+        gs.run_command("r.sim.water", elevation="ned", dx=f"dx_{huc12}", dy=f"dy_{huc12}",
+                       depth=f"depth_{huc12}", niterations=simulation_time, man=f"mannings_{huc12}", rain=f"runoff_{huc12}", env=env)
+        gs.mapcalc(f"transport_capacity_{huc12} = 0.001", env=env)
+        gs.mapcalc(f"detachment_coef_{huc12} = 0.001", env=env)
+        gs.mapcalc(f"shear_stress_{huc12} = 0.01", env=env)
+        gs.run_command("r.sim.sediment", elevation="ned", water_depth=f"depth_{huc12}", dx=f"dx_{huc12}", dy=f"dy_{huc12}",
+                       detachment_coeff=f"detachment_coef_{huc12}", transport_coeff=f"transport_capacity_{huc12}", shear_stress=f"shear_stress_{huc12}",
+                       niterations=simulation_time, erosion_deposition=f"erdep_tmp_{huc12}", nwalkers=5 * region["cells"], env=env)
+        gs.run_command("r.grow", input=f"erdep_tmp_{huc12}", output=f"erdep_{huc12}", radius=-2.01, env=env)
+        # Erosion: extract negative values and convert to positive mass [kg/m^2]
+        gs.mapcalc(f"erosion_{huc12} = if(erdep_{huc12} < 0, abs(erdep_{huc12}) * {simulation_time * 60}, null())", env=env)
+        erosion = gs.parse_command("r.univar", map=f"erosion_{huc12}", format="json", env=env)[0]
+        # Deposition: extract positive values and convert to mass [kg/m^2]
+        gs.mapcalc(f"deposition_{huc12} = if(erdep_{huc12} > 0, abs(erdep_{huc12}) * {simulation_time * 60}, null())", env=env)
+        deposition = gs.parse_command("r.univar", map=f"deposition_{huc12}", format="json", env=env)[0]
+        return {"huc12": huc12, "erosion_mean": erosion["mean"], "deposition_mean": deposition["mean"],
+                "erosion_total": erosion["sum"] * region["nsres"] * region["ewres"],
+                "deposition_total": deposition["sum"] * region["nsres"] * region["ewres"],
+                "difference_total": (deposition["sum"] - erosion["sum"]) * region["nsres"] * region["ewres"]}
+
+if __name__ == "__main__":
+    basins = gs.parse_command("v.db.select", format="json", map="river_basins")["records"]
+    huc12s = [basin["huc12"] for basin in basins]
+    with Pool(processes=15) as pool:
+        result = list(tqdm(pool.imap(compute, huc12s), total=len(huc12s)))
+        with open('result.json', 'w') as fp:
+            json.dump(result, fp)
+```
+
+    Overwriting script.py
+
+
+
+```python
+%run script.py
+```
+
+
+```python
+import json
+
+with open("result.json") as f:
+    stats = json.load(f)
+
+df = pd.DataFrame(stats)
+df.difference_total = (df.deposition_total - df.erosion_total) * 0.001
+df
+```
+
+
+
+
+<div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type {
+        vertical-align: middle;
+    }
+
+    .dataframe tbody tr th {
+        vertical-align: top;
+    }
+
+    .dataframe thead th {
+        text-align: right;
+    }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>huc12</th>
+      <th>erosion_mean</th>
+      <th>deposition_mean</th>
+      <th>erosion_total</th>
+      <th>deposition_total</th>
+      <th>difference_total</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>030401040201</td>
+      <td>20.646103</td>
+      <td>44.283284</td>
+      <td>8.913810e+08</td>
+      <td>8.914314e+08</td>
+      <td>50.322431</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>030401030605</td>
+      <td>15.055591</td>
+      <td>28.255591</td>
+      <td>8.557749e+08</td>
+      <td>8.558053e+08</td>
+      <td>30.473212</td>
+    </tr>
+    <tr>
+      <th>2</th>
+      <td>030401040202</td>
+      <td>10.401586</td>
+      <td>19.790599</td>
+      <td>1.063260e+08</td>
+      <td>1.063309e+08</td>
+      <td>4.880974</td>
+    </tr>
+    <tr>
+      <th>3</th>
+      <td>030401010904</td>
+      <td>79.394734</td>
+      <td>176.675196</td>
+      <td>3.178918e+09</td>
+      <td>3.179023e+09</td>
+      <td>105.273065</td>
+    </tr>
+    <tr>
+      <th>4</th>
+      <td>030401011001</td>
+      <td>62.987737</td>
+      <td>140.063017</td>
+      <td>4.173782e+09</td>
+      <td>4.173920e+09</td>
+      <td>138.324520</td>
+    </tr>
+    <tr>
+      <th>...</th>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+    </tr>
+    <tr>
+      <th>57</th>
+      <td>030401010604</td>
+      <td>51.122014</td>
+      <td>119.279735</td>
+      <td>2.907411e+09</td>
+      <td>2.907515e+09</td>
+      <td>103.920867</td>
+    </tr>
+    <tr>
+      <th>58</th>
+      <td>030401010605</td>
+      <td>74.557491</td>
+      <td>155.412305</td>
+      <td>2.463588e+09</td>
+      <td>2.463751e+09</td>
+      <td>163.018150</td>
+    </tr>
+    <tr>
+      <th>59</th>
+      <td>030401010606</td>
+      <td>96.769987</td>
+      <td>197.665628</td>
+      <td>2.294436e+09</td>
+      <td>2.294522e+09</td>
+      <td>86.636230</td>
+    </tr>
+    <tr>
+      <th>60</th>
+      <td>030401010705</td>
+      <td>100.750627</td>
+      <td>237.449097</td>
+      <td>6.425029e+09</td>
+      <td>6.425159e+09</td>
+      <td>130.196176</td>
+    </tr>
+    <tr>
+      <th>61</th>
+      <td>030401010607</td>
+      <td>86.046074</td>
+      <td>178.787112</td>
+      <td>1.841076e+09</td>
+      <td>1.841168e+09</td>
+      <td>91.340150</td>
+    </tr>
+  </tbody>
+</table>
+<p>62 rows × 6 columns</p>
+</div>
+
+
+
+
+```python
+import geopandas as gpd
+
+gdf = gpd.read_file(hydro_filename, layer="WBDHU12")
+gdf = gdf.merge(df, on="huc12", how="left")
+gdf = gdf.drop(columns=["loaddate"])
+gdf = gdf[gdf["erosion_total"].notna()]
+```
+
+
+```python
+import folium
+import branca.colormap as cm
+
+metric = "erosion_mean"
+color_scale = cm.linear.OrRd_09.scale(min(gdf[metric]), max(gdf[metric]))
+# divergent
+# color_scale = cm.LinearColormap(colors=['blue', 'white','red'],
+#                                 index=[-max(gdf[metric]), 0, max(gdf[metric])],
+#                                 vmin=-max(gdf[metric]),vmax=max(gdf[metric]))
+color_scale.caption = "Mean erosion [kg/m2]"
+region = gs.parse_command("g.region", vector="river_basins", format="json", flags="b")
+m = folium.Map(location=[region["ll_clat"], region["ll_clon"]], zoom_start=9)
+
+tooltip = folium.GeoJsonTooltip(
+    fields=["huc12", "erosion_mean", "deposition_mean", "difference_total"],
+    aliases=["HUC12", "Mean erosion [kg/m2]:", "Mean deposition [kg/m2]:", "Net Difference [kg]:"],
+    localize=True,
+    sticky=False,
+    labels=True,
+    style="""
+        background-color: #F0EFEF;
+        border: 2px solid black;
+        border-radius: 3px;
+        box-shadow: 3px;
+    """,
+    max_width=800,
+)
+
+g = folium.GeoJson(
+    gdf,
+    style_function=lambda x: {
+        "fillColor": color_scale(x["properties"][metric]),
+        "color": "black", "weight": 1,
+        "fillOpacity": 0.4,
+    },
+    tooltip=tooltip,
+).add_to(m)
+gj.Raster("erdep_030401010406").add_to(m)
+color_scale.add_to(m)
+folium.LayerControl().add_to(m)
+m
+```
